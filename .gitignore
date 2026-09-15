@@ -1,0 +1,38 @@
+.venv/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Node (present in this folder too)
+node_modules/
+
+# Logs
+*.log
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+
+# DB (if using local SQLite during dev)
+*.sqlite3
+*.db
