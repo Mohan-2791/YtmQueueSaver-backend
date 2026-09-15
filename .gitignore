@@ -36,3 +36,5 @@ Thumbs.db
 # DB (if using local SQLite during dev)
 *.sqlite3
 *.db
+
+
