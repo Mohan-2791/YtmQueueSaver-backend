@@ -1,7 +1,7 @@
 import os
 import json
 import base64
-import hashlib
+import secrets
 import datetime
 import logging
 from typing import Optional
@@ -20,20 +20,62 @@ import models
 
 logger = logging.getLogger("ytm_saver.auth")
 
+# --- Environment mode --------------------------------------------------------
+# Controls whether we allow convenience fallbacks (ephemeral dev secrets,
+# the /api/auth/test-login route). Set APP_ENV=production in any real
+# deployment. Defaults to "development" so local setup keeps working
+# out of the box with zero extra config.
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+IS_PRODUCTION = APP_ENV == "production"
+
 # --- App-issued session JWT --------------------------------------------------
-JWT_SECRET = os.getenv("JWT_SECRET", "ytm-queue-saver-production-secret-change-me")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days default
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
+# SECURITY: previously this fell back to a hardcoded string
+# ("ytm-queue-saver-production-secret-change-me") baked into source control.
+# Anyone who read the repo could forge a valid session JWT for any user ID.
+# Now: production refuses to boot without an explicit secret, and local/dev
+# gets a random secret generated fresh each process start (sessions just
+# won't survive a restart, which is fine for dev and safe by default).
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    if IS_PRODUCTION:
+        raise RuntimeError(
+            "JWT_SECRET is not set. Refusing to start in production without an explicit, "
+            "randomly generated secret. Set the JWT_SECRET environment variable "
+            "(e.g. `python -c \"import secrets; print(secrets.token_urlsafe(64))\"`)."
+        )
+    JWT_SECRET = secrets.token_urlsafe(64)
+    logger.warning(
+        "JWT_SECRET not set - generated an ephemeral random secret for this dev process. "
+        "Existing sessions will NOT survive a restart. Set JWT_SECRET explicitly for anything "
+        "beyond local development."
+    )
+
 # --- Symmetric encryption for stored OAuth tokens --------------------------
+# SECURITY: previously derived deterministically from JWT_SECRET, meaning a
+# leak of one secret leaked both the session-signing key AND the key
+# protecting every user's stored YouTube OAuth credentials. These must be
+# independent secrets. Production now requires FERNET_KEY explicitly; dev
+# gets a freshly generated random key each process start.
 FERNET_KEY = os.getenv("FERNET_KEY")
 if not FERNET_KEY:
-    # Deterministically derive 32-byte urlsafe base64 key from JWT_SECRET to avoid runtime crashes
-    derived = base64.urlsafe_b64encode(hashlib.sha256(JWT_SECRET.encode()).digest()).decode()
-    FERNET_KEY = derived
-    logger.info("FERNET_KEY derived deterministically from JWT_SECRET.")
+    if IS_PRODUCTION:
+        raise RuntimeError(
+            "FERNET_KEY is not set. Refusing to start in production without an explicit, "
+            "independently generated encryption key. Set the FERNET_KEY environment variable "
+            "(e.g. `python -c \"from cryptography.fernet import Fernet; "
+            "print(Fernet.generate_key().decode())\"`)."
+        )
+    FERNET_KEY = Fernet.generate_key().decode()
+    logger.warning(
+        "FERNET_KEY not set - generated an ephemeral random key for this dev process. "
+        "Any tokens encrypted now will be UNREADABLE after a restart. Set FERNET_KEY "
+        "explicitly for anything beyond local development."
+    )
 
 cipher = Fernet(FERNET_KEY.encode())
 
@@ -94,9 +136,18 @@ def verify_google_access_token(access_token_str: str) -> Optional[dict]:
         return None
 
     info = info_resp.json()
+
+    # SECURITY: previously this only logged a warning on a client-ID mismatch
+    # and then continued anyway, meaning an access token minted for a totally
+    # different OAuth client (not this app) would still be accepted as long
+    # as it resolved to *some* valid Google account. We now hard-reject.
     if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_ID not in (info.get("aud"), info.get("azp")):
-        logger.warning("Token client ID %s did not match configured client %s", info.get("aud"), GOOGLE_CLIENT_ID)
-        # Continue if client ID matches or proceed to userinfo verification
+        logger.warning(
+            "Rejecting access token: client ID %s did not match configured client %s",
+            info.get("aud") or info.get("azp"),
+            GOOGLE_CLIENT_ID,
+        )
+        return None
 
     try:
         userinfo_resp = requests.get(
@@ -150,34 +201,35 @@ def get_current_user(
 ) -> models.User:
     """
     Derives and verifies the authenticated user from the Bearer JWT token.
-    Falls back to a default production user if authorization is absent during setup.
+
+    SECURITY: this previously fell back to a default "user 1" (creating it if
+    missing) whenever no Authorization header was present at all, which made
+    every "protected" endpoint reachable anonymously. There is no longer any
+    unauthenticated fallback - a missing or invalid token is always a 401.
     """
-    if credentials and credentials.credentials:
-        try:
-            payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            user_id = int(payload.get("sub"))
-            user = db.query(models.User).filter(models.User.id == user_id).first()
-            if user:
-                return user
-        except (jwt.PyJWTError, TypeError, ValueError):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired session token",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-    # In case unauthenticated requests are accepted during extension onboarding:
-    # return the primary user or create standard user 1
-    fallback_user = db.query(models.User).filter(models.User.id == 1).first()
-    if not fallback_user:
-        fallback_user = models.User(
-            id=1,
-            google_id="default_user",
-            email="user@ytm-saver.app",
-            encrypted_token_json=encrypt_tokens({}),
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
         )
-        db.add(fallback_user)
-        db.commit()
-        db.refresh(fallback_user)
 
-    return fallback_user
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except (jwt.PyJWTError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return user

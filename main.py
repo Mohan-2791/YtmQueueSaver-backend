@@ -26,9 +26,22 @@ app = FastAPI(
 )
 
 # --- Production CORS Configuration -----------------------------------------
-# Supports Chrome Extensions via regex and custom production web domains
+# Supports Chrome Extensions via regex and custom production web domains.
+#
+# SECURITY NOTE: the wildcard regex below (`chrome-extension://.*`) matches
+# ANY installed Chrome extension, not just this project's. Combined with
+# allow_credentials=True, that means any extension a user has installed
+# could make authenticated requests to this API. Once you have a published
+# extension ID, set ALLOWED_ORIGIN_REGEX to pin it to that exact ID, e.g.
+#   ALLOWED_ORIGIN_REGEX=^chrome-extension://abcdefghijklmnopabcdefghijklmnop$
 ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", r"^chrome-extension://.*$")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+if auth.IS_PRODUCTION and ALLOWED_ORIGIN_REGEX == r"^chrome-extension://.*$":
+    logger.warning(
+        "Running in production with the default wildcard chrome-extension origin regex. "
+        "Set ALLOWED_ORIGIN_REGEX to your specific published extension ID."
+    )
 
 app.add_middleware(
     CORSMiddleware,
@@ -94,7 +107,15 @@ def register_user(payload: schemas.OAuthLoginSchema, db: Session = Depends(get_d
 def test_login(db: Session = Depends(get_db)):
     """
     Issues a verified session token for local testing without requiring external Google OAuth credentials.
+
+    SECURITY: this route performs NO real authentication - it must never be
+    reachable in production, since it's otherwise a one-request account
+    takeover of the local_dev_user account. It now 404s (rather than 403,
+    so its existence isn't even revealed) whenever APP_ENV=production.
     """
+    if auth.IS_PRODUCTION:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
     user = db.query(models.User).filter(models.User.google_id == "local_dev_user").first()
     if not user:
         user = models.User(
