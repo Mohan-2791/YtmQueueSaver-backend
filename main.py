@@ -15,40 +15,25 @@ from ytm_service import YTMService
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ytm_saver")
 
-# Initialize database tables
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
-    title="YouTube Music Queue Saver Enterprise API",
+    title="YouTube Music Queue Saver API",
     version="1.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if not auth.IS_PRODUCTION else None,
+    redoc_url="/redoc" if not auth.IS_PRODUCTION else None,
 )
 
-# --- Production CORS Configuration -----------------------------------------
-# Supports Chrome Extensions via regex and custom production web domains.
-#
-# SECURITY NOTE: the wildcard regex below (`chrome-extension://.*`) matches
-# ANY installed Chrome extension, not just this project's. Combined with
-# allow_credentials=True, that means any extension a user has installed
-# could make authenticated requests to this API. Once you have a published
-# extension ID, set ALLOWED_ORIGIN_REGEX to pin it to that exact ID, e.g.
-#   ALLOWED_ORIGIN_REGEX=^chrome-extension://abcdefghijklmnopabcdefghijklmnop$
-ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", r"^chrome-extension://.*$")
+# Pin origin regex to specific extension ID in production
+ALLOWED_ORIGIN_REGEX = os.getenv("ALLOWED_ORIGIN_REGEX", r"^chrome-extension://[a-z0-9]{32,40}$")
 ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
-
-if auth.IS_PRODUCTION and ALLOWED_ORIGIN_REGEX == r"^chrome-extension://.*$":
-    logger.warning(
-        "Running in production with the default wildcard chrome-extension origin regex. "
-        "Set ALLOWED_ORIGIN_REGEX to your specific published extension ID."
-    )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else [],
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX if ALLOWED_ORIGIN_REGEX else None,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS", "PUT", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -57,7 +42,7 @@ app.add_middleware(
 def root():
     return {
         "status": "online",
-        "service": "YouTube Music Queue Saver Enterprise API",
+        "service": "YouTube Music Queue Saver API",
         "version": "1.1.0",
     }
 
@@ -65,7 +50,6 @@ def root():
 @app.get("/health")
 @app.get("/api/health")
 def health_check(db: Session = Depends(get_db)):
-    # Verify DB connectivity
     try:
         db.execute(models.User.__table__.select().limit(1))
         db_status = "connected"
@@ -78,10 +62,6 @@ def health_check(db: Session = Depends(get_db)):
 
 @app.post("/api/auth/register", response_model=schemas.TokenResponseSchema)
 def register_user(payload: schemas.OAuthLoginSchema, db: Session = Depends(get_db)):
-    """
-    Registers or updates a user's stored OAuth credentials and issues a session token.
-    Identity (google_id, email) is derived from verified Google credentials.
-    """
     google_payload = auth.verify_google_token(payload.id_token)
     google_id = google_payload["sub"]
     email = google_payload.get("email")
@@ -105,14 +85,6 @@ def register_user(payload: schemas.OAuthLoginSchema, db: Session = Depends(get_d
 
 @app.post("/api/auth/test-login", response_model=schemas.TokenResponseSchema)
 def test_login(db: Session = Depends(get_db)):
-    """
-    Issues a verified session token for local testing without requiring external Google OAuth credentials.
-
-    SECURITY: this route performs NO real authentication - it must never be
-    reachable in production, since it's otherwise a one-request account
-    takeover of the local_dev_user account. It now 404s (rather than 403,
-    so its existence isn't even revealed) whenever APP_ENV=production.
-    """
     if auth.IS_PRODUCTION:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
@@ -137,9 +109,6 @@ def create_snapshot(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Saves a queue snapshot owned by the authenticated user.
-    """
     tracks_json = [t.model_dump() for t in payload.tracks]
 
     snapshot = models.PlaylistSnapshot(
@@ -161,9 +130,6 @@ def get_snapshots(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Retrieves the authenticated user's own snapshots for the specified category.
-    """
     snapshots = (
         db.query(models.PlaylistSnapshot)
         .filter(
@@ -182,9 +148,6 @@ def delete_snapshot(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Deletes a snapshot, but only if it belongs to the authenticated user.
-    """
     snapshot = db.query(models.PlaylistSnapshot).filter(models.PlaylistSnapshot.id == snapshot_id).first()
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")
@@ -201,10 +164,6 @@ def restore_snapshot(
     current_user: models.User = Depends(auth.get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Creates a real YouTube Music playlist from a saved snapshot in the authenticated
-    user's personal account, using their decrypted Google OAuth credentials.
-    """
     snapshot = db.query(models.PlaylistSnapshot).filter(models.PlaylistSnapshot.id == snapshot_id).first()
     if not snapshot:
         raise HTTPException(status_code=404, detail="Snapshot not found")

@@ -18,14 +18,12 @@ class TrackSchema(BaseModel):
     @field_validator("videoId")
     @classmethod
     def videoId_must_be_sane(cls, v: str) -> str:
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", v):
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v):
             raise ValueError("videoId contains unexpected characters")
         return v
 
 
 class SnapshotCreateSchema(BaseModel):
-    # user_id intentionally removed: the owner is derived from the
-    # authenticated session, never taken from the request body.
     title: str = Field(..., min_length=1, max_length=255, example="Auto-Saved Queue")
     category: Literal[ALLOWED_CATEGORIES] = Field(..., example="SESSION_WIPE")
     playback_mode: Literal[ALLOWED_PLAYBACK_MODES] = Field(default="SONG")
@@ -46,13 +44,7 @@ class SnapshotResponseSchema(BaseModel):
 
 
 class OAuthLoginSchema(BaseModel):
-    # A real Google credential -- either an ID token (JWT) or an OAuth access
-    # token (e.g. from chrome.identity.getAuthToken()) -- verified
-    # server-side in auth.verify_google_token. google_id/email are NEVER
-    # trusted from the client directly.
     id_token: str = Field(..., min_length=1)
-    # The ytmusicapi OAuth token payload (access_token/refresh_token/etc.) to
-    # store encrypted, used later to act on the user's YouTube Music account.
     token_data: dict
 
 

@@ -104,7 +104,7 @@ Base Python images run as `root` unless told otherwise, which is bad practice fo
 
 ```bash
 # 1. Clone and install
-git clone <your-repo-url>
+git clone https://github.com/Mohan-2791/YtmQueueSaver-backend.git
 cd ytm-queue-saver-backend
 pip install -r requirements.txt
 
