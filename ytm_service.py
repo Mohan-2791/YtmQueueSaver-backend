@@ -112,7 +112,28 @@ class YTMService:
     def _get_ytmusic_instance(self) -> Tuple[YTMusic, str]:
         """
         Creates an authenticated YTMusic client using a secure short-lived temporary credentials file.
+
+        NOTE: ytmusicapi's OAuth support (OAuthCredentials/RefreshingToken) requires a
+        full token set - access_token, refresh_token, scope, token_type, expires_at -
+        the kind you get from a server-side authorization-code exchange. Tokens
+        acquired via chrome.identity.getAuthToken() are access-token-only; Chrome
+        manages refresh internally and never exposes a refresh_token to the app. So
+        this fallback is only usable if token_data actually came from a full OAuth
+        exchange. If it didn't, fail with a clear message instead of letting
+        ytmusicapi raise an opaque TypeError deep in its own constructor.
         """
+        required_fields = ("refresh_token", "scope", "token_type")
+        missing = [f for f in required_fields if not self.token_data.get(f)]
+        if missing:
+            raise RuntimeError(
+                f"Cannot use the ytmusicapi fallback: token_data is missing {missing}. "
+                "This is expected when the access token came from "
+                "chrome.identity.getAuthToken(), which does not provide a refresh "
+                "token. The YouTube Data API v3 path (using the access_token directly) "
+                "is the only usable restore path for these tokens - check why that path "
+                "failed rather than relying on this fallback."
+            )
+
         fd, temp_path = tempfile.mkstemp(suffix=".json")
         try:
             os.chmod(temp_path, 0o600)
