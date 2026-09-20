@@ -6,6 +6,12 @@ from urllib.parse import quote_plus
 
 logger = logging.getLogger("ytm_saver.db")
 
+# Computed locally (not imported from auth.py) to avoid a circular import:
+# auth.py imports `get_db` from this module, so this module cannot import
+# anything back from auth.py.
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+IS_PRODUCTION = APP_ENV == "production"
+
 DB_USER = os.getenv("DB_USER", "postgres")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -20,6 +26,19 @@ if not DATABASE_URL:
         encoded_password = quote_plus(DB_PASSWORD)
         DATABASE_URL = f"postgresql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
     else:
+        # SECURITY: previously this silently fell back to a local SQLite file
+        # in ANY environment, including production. On most PaaS platforms
+        # the filesystem is ephemeral, so the app would look like it was
+        # working - users could register and save data - right up until the
+        # next redeploy or restart wiped it all. Production now refuses to
+        # start instead of silently degrading to a throwaway database.
+        if IS_PRODUCTION:
+            raise RuntimeError(
+                "No database configured for production. Set DATABASE_URL (preferred, e.g. "
+                "the value your hosting platform's managed Postgres provides) or DB_PASSWORD "
+                "plus DB_USER/DB_HOST/DB_PORT/DB_NAME. Refusing to silently fall back to "
+                "SQLite in production."
+            )
         DATABASE_URL = "sqlite:///./ytm_queue_saver.db"
         logger.warning("No Postgres credentials found. Defaulting to local SQLite: %s", DATABASE_URL)
 

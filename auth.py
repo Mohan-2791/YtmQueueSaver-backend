@@ -93,7 +93,27 @@ def decrypt_tokens(encrypted_str: str) -> dict:
 
 
 # --- Google Credential verification -------------------------------------------
+# SECURITY: previously, if this was left unset (typo, forgotten env var, etc),
+# GOOGLE_CLIENT_ID was "" — which is falsy, so the audience check inside
+# verify_google_access_token was silently skipped entirely. That meant ANY
+# valid Google access token, minted for ANY OAuth client (not just this app),
+# would be accepted as a login. Same class of bug as the JWT_SECRET/FERNET_KEY
+# fallback, just not caught the first time around. Production now refuses to
+# boot without it, exactly like the two secrets above.
 GOOGLE_CLIENT_ID = os.getenv("YTM_CLIENT_ID") or os.getenv("GOOGLE_CLIENT_ID", "")
+if not GOOGLE_CLIENT_ID:
+    if IS_PRODUCTION:
+        raise RuntimeError(
+            "YTM_CLIENT_ID (or GOOGLE_CLIENT_ID) is not set. Refusing to start in production "
+            "without it - without this, Google credential verification cannot check the "
+            "token's audience, which would allow tokens minted for other OAuth clients to be "
+            "accepted as valid logins."
+        )
+    logger.warning(
+        "YTM_CLIENT_ID/GOOGLE_CLIENT_ID not set - Google login verification will reject all "
+        "credentials in this dev process. Use POST /api/auth/test-login for local development, "
+        "or set YTM_CLIENT_ID to test real Google sign-in."
+    )
 
 
 def verify_google_id_token(id_token_str: str) -> Optional[dict]:
@@ -123,6 +143,17 @@ def verify_google_access_token(access_token_str: str) -> Optional[dict]:
     Verify a Google OAuth access token (from chrome.identity in the extension)
     by querying Google's tokeninfo endpoint and userinfo endpoint.
     """
+    # SECURITY: hard reject rather than silently skip the audience check when
+    # GOOGLE_CLIENT_ID isn't configured. In production this branch is
+    # unreachable (see fail-closed check above); in dev it means access-token
+    # login is disabled until YTM_CLIENT_ID is set, rather than accepting any
+    # Google account's token unconditionally.
+    if not GOOGLE_CLIENT_ID:
+        logger.warning(
+            "Rejecting access token verification attempt: GOOGLE_CLIENT_ID is not configured."
+        )
+        return None
+
     try:
         info_resp = requests.get(
             "https://oauth2.googleapis.com/tokeninfo",
@@ -141,7 +172,7 @@ def verify_google_access_token(access_token_str: str) -> Optional[dict]:
     # and then continued anyway, meaning an access token minted for a totally
     # different OAuth client (not this app) would still be accepted as long
     # as it resolved to *some* valid Google account. We now hard-reject.
-    if GOOGLE_CLIENT_ID and GOOGLE_CLIENT_ID not in (info.get("aud"), info.get("azp")):
+    if GOOGLE_CLIENT_ID not in (info.get("aud"), info.get("azp")):
         logger.warning(
             "Rejecting access token: client ID %s did not match configured client %s",
             info.get("aud") or info.get("azp"),

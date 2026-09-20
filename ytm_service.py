@@ -21,6 +21,19 @@ class YTMService:
         self.client_id = os.getenv("YTM_CLIENT_ID") or os.getenv("GOOGLE_CLIENT_ID", "")
         self.client_secret = os.getenv("YTM_CLIENT_SECRET", "")
 
+        # If your Google OAuth client is a "confidential" client type (as
+        # opposed to a public/installed client), ytmusicapi's OAuth flow
+        # needs the client secret to refresh tokens. An empty value here
+        # won't necessarily break anything (public clients don't need one),
+        # but if restores start failing with auth errors in production and
+        # this is empty, check your OAuth client type first.
+        if not self.client_secret:
+            logger.warning(
+                "YTM_CLIENT_SECRET is not set. This is fine for a public/installed OAuth "
+                "client, but if your Google OAuth client is a confidential client type, "
+                "token refresh during playlist restore will fail."
+            )
+
     def _add_single_track(self, items_url: str, headers: dict, playlist_id: str, video_id: str) -> None:
         """Adds one track to the playlist. Raises nothing on failure — logs and
         returns, matching the previous best-effort behavior (one bad video ID
