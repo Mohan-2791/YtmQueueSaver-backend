@@ -1,7 +1,9 @@
 import os
 import json
 import logging
+import random
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple
 import requests
@@ -9,10 +11,17 @@ from ytmusicapi import YTMusic, OAuthCredentials
 
 logger = logging.getLogger("ytm_saver.service")
 
-# Cap concurrent requests to YouTube's API so we don't trip rate limits
-# on very large playlists while still being drastically faster than
-# one-request-at-a-time.
-MAX_CONCURRENT_ADDS = 8
+# YouTube's playlistItems.insert endpoint sometimes rejects concurrent writes
+# to the SAME playlist with 409 ABORTED / SERVICE_UNAVAILABLE - the busier the
+# concurrency, the more of these show up. Rather than go fully sequential
+# (safe but slow - ~1-2s per track for larger playlists), we keep a modest
+# amount of concurrency and pair it with retries: most requests succeed on
+# the first pass, and the ones that collide just get retried a couple of
+# times with jittered backoff instead of being silently dropped. Tunable via
+# env var if you want to experiment with the tradeoff.
+MAX_CONCURRENT_ADDS = int(os.getenv("YTM_MAX_CONCURRENT_ADDS", "3"))
+TRACK_ADD_MAX_RETRIES = 3
+TRACK_ADD_RETRY_BASE_SECONDS = 1.0
 
 
 class YTMService:
@@ -34,25 +43,58 @@ class YTMService:
                 "token refresh during playlist restore will fail."
             )
 
-    def _add_single_track(self, items_url: str, headers: dict, playlist_id: str, video_id: str) -> None:
-        """Adds one track to the playlist. Raises nothing on failure — logs and
-        returns, matching the previous best-effort behavior (one bad video ID
-        shouldn't sink the whole restore)."""
-        try:
-            item_payload = {
-                "snippet": {
-                    "playlistId": playlist_id,
-                    "resourceId": {
-                        "kind": "youtube#video",
-                        "videoId": video_id,
-                    },
-                }
+    def _add_single_track(self, items_url: str, headers: dict, playlist_id: str, video_id: str) -> bool:
+        """
+        Adds one track to the playlist, retrying a bounded number of times on
+        the 409 ABORTED / SERVICE_UNAVAILABLE response YouTube returns when a
+        playlist is under write contention. Returns True on success, False if
+        every attempt failed (logged either way; never raises, so one bad
+        video ID doesn't sink the whole restore).
+        """
+        item_payload = {
+            "snippet": {
+                "playlistId": playlist_id,
+                "resourceId": {
+                    "kind": "youtube#video",
+                    "videoId": video_id,
+                },
             }
-            item_resp = requests.post(items_url, headers=headers, json=item_payload, timeout=8)
-            if not item_resp.ok:
-                logger.warning("Failed to append track %s to playlist %s: %s", video_id, playlist_id, item_resp.text)
-        except Exception as item_err:
-            logger.warning("Exception appending track %s: %s", video_id, item_err)
+        }
+
+        for attempt in range(1, TRACK_ADD_MAX_RETRIES + 1):
+            try:
+                item_resp = requests.post(items_url, headers=headers, json=item_payload, timeout=8)
+                if item_resp.ok:
+                    return True
+
+                is_retryable = item_resp.status_code in (409, 429, 500, 503)
+                if is_retryable and attempt < TRACK_ADD_MAX_RETRIES:
+                    delay = TRACK_ADD_RETRY_BASE_SECONDS * attempt + random.uniform(0, 0.75)
+                    logger.info(
+                        "Retryable error adding track %s (attempt %d/%d), retrying in %.1fs: %s",
+                        video_id, attempt, TRACK_ADD_MAX_RETRIES, delay, item_resp.text,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                logger.warning(
+                    "Failed to append track %s to playlist %s after %d attempt(s): %s",
+                    video_id, playlist_id, attempt, item_resp.text,
+                )
+                return False
+            except requests.RequestException as item_err:
+                if attempt < TRACK_ADD_MAX_RETRIES:
+                    delay = TRACK_ADD_RETRY_BASE_SECONDS * attempt + random.uniform(0, 0.75)
+                    logger.info(
+                        "Network error adding track %s (attempt %d/%d), retrying in %.1fs: %s",
+                        video_id, attempt, TRACK_ADD_MAX_RETRIES, delay, item_err,
+                    )
+                    time.sleep(delay)
+                    continue
+                logger.warning("Exception appending track %s after %d attempt(s): %s", video_id, attempt, item_err)
+                return False
+
+        return False
 
     def _restore_via_youtube_data_api(
         self, title: str, tracks: List[Dict], playback_mode: str, access_token: str
@@ -61,9 +103,14 @@ class YTMService:
         Creates a playlist directly in the user's YouTube / YouTube Music personal account
         using the user's Google OAuth Bearer access token via official YouTube Data API v3.
 
-        Track-adding is parallelized (bounded by MAX_CONCURRENT_ADDS) since YouTube's API
-        has no batch "add many videos" endpoint — sequential one-at-a-time calls were the
-        reason large restores took 15-25+ seconds and blew past client-side timeouts.
+        Track-adding uses bounded concurrency (MAX_CONCURRENT_ADDS) plus per-request
+        retries. YouTube's playlistItems.insert endpoint has no batch "add many videos"
+        endpoint, and full concurrency (previously 8 parallel workers) caused a
+        meaningful fraction of requests to be rejected with 409 ABORTED /
+        SERVICE_UNAVAILABLE due to write contention on the same playlist. Lower
+        concurrency plus retries keeps most of the speed while still landing every
+        track: most requests succeed on the first attempt, and the ones that collide
+        get retried instead of silently dropped.
         """
         description = f"Restored via YTM Queue Saver ({playback_mode} Mode)"
 
@@ -92,20 +139,35 @@ class YTMService:
         if not playlist_id:
             raise RuntimeError("YouTube API response missing playlist ID")
 
-        # 2. Add tracks to playlist CONCURRENTLY instead of one-by-one
+        # 2. Add tracks to playlist with bounded concurrency (see docstring)
         items_url = "https://www.googleapis.com/youtube/v3/playlistItems?part=snippet"
         video_ids = [t["videoId"] for t in tracks if isinstance(t, dict) and t.get("videoId")]
 
+        failed_video_ids = []
         if video_ids:
             with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_ADDS) as executor:
-                futures = [
-                    executor.submit(self._add_single_track, items_url, headers, playlist_id, video_id)
+                future_to_video_id = {
+                    executor.submit(self._add_single_track, items_url, headers, playlist_id, video_id): video_id
                     for video_id in video_ids
-                ]
-                # Drain futures so we don't return before all adds have at least
-                # attempted (errors are already swallowed/logged inside the task).
-                for future in as_completed(futures):
-                    future.result()
+                }
+                for future in as_completed(future_to_video_id):
+                    video_id = future_to_video_id[future]
+                    try:
+                        success = future.result()
+                    except Exception as unexpected_err:
+                        # _add_single_track already catches requests exceptions internally;
+                        # this only catches anything truly unexpected so one bad future
+                        # can't crash the whole restore.
+                        logger.warning("Unexpected error adding track %s: %s", video_id, unexpected_err)
+                        success = False
+                    if not success:
+                        failed_video_ids.append(video_id)
+
+        if failed_video_ids:
+            logger.warning(
+                "Restore to playlist %s completed with %d/%d tracks failing after retries: %s",
+                playlist_id, len(failed_video_ids), len(video_ids), failed_video_ids,
+            )
 
         return playlist_id
 
