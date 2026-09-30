@@ -1,106 +1,72 @@
-import os
-import json
-import base64
-import secrets
 import datetime
 import logging
+import os
+import threading
+import time
 from typing import Optional
 
 import jwt
 import requests
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from cryptography.fernet import Fernet
 from google.oauth2 import id_token as google_id_token
 from google.auth.transport import requests as google_requests
 from sqlalchemy.orm import Session
 
+import audit
+import config
+import crypto
 from database import get_db
 import models
 
 logger = logging.getLogger("ytm_saver.auth")
 
-# --- Environment mode --------------------------------------------------------
-# Controls whether we allow convenience fallbacks (ephemeral dev secrets,
-# the /api/auth/test-login route). Set APP_ENV=production in any real
-# deployment. Defaults to "development" so local setup keeps working
-# out of the box with zero extra config.
-APP_ENV = os.getenv("APP_ENV", "development").lower()
-IS_PRODUCTION = APP_ENV == "production"
+APP_ENV = config.APP_ENV
+IS_PRODUCTION = config.IS_PRODUCTION
 
-# --- App-issued session JWT --------------------------------------------------
-JWT_ALGORITHM = "HS256"
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "10080"))  # 7 days default
+# One pooled session for all outbound Google identity calls: keeps TLS
+# connections alive across requests instead of paying a new handshake every
+# time, and is the single place outbound egress is scoped.
+_google_http = requests.Session()
+_google_http.headers.update({"User-Agent": "ytm-queue-saver/1.1"})
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
-# SECURITY: previously this fell back to a hardcoded string
-# ("ytm-queue-saver-production-secret-change-me") baked into source control.
-# Anyone who read the repo could forge a valid session JWT for any user ID.
-# Now: production refuses to boot without an explicit secret, and local/dev
-# gets a random secret generated fresh each process start (sessions just
-# won't survive a restart, which is fine for dev and safe by default).
-JWT_SECRET = os.getenv("JWT_SECRET")
-if not JWT_SECRET:
+
+# --- App-issued session JWT (asymmetric, RS256) ------------------------------
+def _load_jwt_keys():
+    private_key = os.getenv("JWT_PRIVATE_KEY")
+    public_key = os.getenv("JWT_PUBLIC_KEY")
+    if private_key and public_key:
+        # Support literal "\n" escapes, which is how these usually end up in a
+        # PaaS dashboard's single-line environment variable editor.
+        private_key = private_key.replace("\\n", "\n")
+        public_key = public_key.replace("\\n", "\n")
+        return private_key, public_key
     if IS_PRODUCTION:
-        raise RuntimeError(
-            "JWT_SECRET is not set. Refusing to start in production without an explicit, "
-            "randomly generated secret. Set the JWT_SECRET environment variable "
-            "(e.g. `python -c \"import secrets; print(secrets.token_urlsafe(64))\"`)."
-        )
-    JWT_SECRET = secrets.token_urlsafe(64)
-    logger.warning(
-        "JWT_SECRET not set - generated an ephemeral random secret for this dev process. "
-        "Existing sessions will NOT survive a restart. Set JWT_SECRET explicitly for anything "
-        "beyond local development."
-    )
+        raise RuntimeError("JWT_PRIVATE_KEY and JWT_PUBLIC_KEY are required in production for RS256 JWTs.")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
 
-# --- Symmetric encryption for stored OAuth tokens --------------------------
-# SECURITY: previously derived deterministically from JWT_SECRET, meaning a
-# leak of one secret leaked both the session-signing key AND the key
-# protecting every user's stored YouTube OAuth credentials. These must be
-# independent secrets. Production now requires FERNET_KEY explicitly; dev
-# gets a freshly generated random key each process start.
-FERNET_KEY = os.getenv("FERNET_KEY")
-if not FERNET_KEY:
-    if IS_PRODUCTION:
-        raise RuntimeError(
-            "FERNET_KEY is not set. Refusing to start in production without an explicit, "
-            "independently generated encryption key. Set the FERNET_KEY environment variable "
-            "(e.g. `python -c \"from cryptography.fernet import Fernet; "
-            "print(Fernet.generate_key().decode())\"`)."
-        )
-    FERNET_KEY = Fernet.generate_key().decode()
-    logger.warning(
-        "FERNET_KEY not set - generated an ephemeral random key for this dev process. "
-        "Any tokens encrypted now will be UNREADABLE after a restart. Set FERNET_KEY "
-        "explicitly for anything beyond local development."
-    )
-
-cipher = Fernet(FERNET_KEY.encode())
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    public_pem = key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("utf-8")
+    logger.warning("JWT keys not set - generated ephemeral RSA keypair for dev.")
+    return private_pem, public_pem
 
 
-def encrypt_tokens(token_dict: dict) -> str:
-    """Encrypt OAuth token dictionary before storing in database."""
-    raw_json = json.dumps(token_dict)
-    return cipher.encrypt(raw_json.encode()).decode()
+JWT_PRIVATE_KEY, JWT_PUBLIC_KEY = _load_jwt_keys()
 
 
-def decrypt_tokens(encrypted_str: str) -> dict:
-    """Decrypt token string back into dictionary for YouTube Music operations."""
-    decrypted_bytes = cipher.decrypt(encrypted_str.encode())
-    return json.loads(decrypted_bytes.decode())
-
-
-# --- Google Credential verification -------------------------------------------
-# SECURITY: previously, if this was left unset (typo, forgotten env var, etc),
-# GOOGLE_CLIENT_ID was "" — which is falsy, so the audience check inside
-# verify_google_access_token was silently skipped entirely. That meant ANY
-# valid Google access token, minted for ANY OAuth client (not just this app),
-# would be accepted as a login. Same class of bug as the JWT_SECRET/FERNET_KEY
-# fallback, just not caught the first time around. Production now refuses to
-# boot without it, exactly like the two secrets above.
-GOOGLE_CLIENT_ID = os.getenv("YTM_CLIENT_ID") or os.getenv("GOOGLE_CLIENT_ID", "")
+# --- Google credential verification ------------------------------------------
+GOOGLE_CLIENT_ID = config.GOOGLE_CLIENT_ID
 if not GOOGLE_CLIENT_ID:
     if IS_PRODUCTION:
         raise RuntimeError(
@@ -119,6 +85,11 @@ if not GOOGLE_CLIENT_ID:
 def verify_google_id_token(id_token_str: str) -> Optional[dict]:
     """
     Verify a Google-issued ID token (a signed JWT) and return its payload.
+
+    `verify_oauth2_token` checks the RS256 signature against Google's published
+    certs, the `aud` claim, the `iss` claim and `exp`. We additionally pin `iss`
+    explicitly because a misconfigured or attacker-supplied issuer would
+    otherwise be the library's problem.
     """
     if not GOOGLE_CLIENT_ID:
         return None
@@ -127,27 +98,33 @@ def verify_google_id_token(id_token_str: str) -> Optional[dict]:
         payload = google_id_token.verify_oauth2_token(
             id_token_str, google_requests.Request(), GOOGLE_CLIENT_ID
         )
-    except ValueError:
+    except ValueError as exc:
+        logger.info("Google ID token verification failed: %s", type(exc).__name__)
         return None
 
     if payload.get("aud") != GOOGLE_CLIENT_ID:
         return None
     if payload.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
         return None
+    if not payload.get("sub"):
+        return None
 
+    # `nonce` is only meaningful if this backend generated one; the published
+    # extension performs the ID-token exchange through chrome.identity, so we
+    # observe but do not verify it. Flagged as [NEEDS FRONTEND] in HARDENING.md.
+    if "nonce" in payload:
+        logger.debug("Google ID token carries a nonce (not verified: flow is extension-owned)")
     return payload
 
 
 def verify_google_access_token(access_token_str: str) -> Optional[dict]:
     """
-    Verify a Google OAuth access token (from chrome.identity in the extension)
-    by querying Google's tokeninfo endpoint and userinfo endpoint.
+    Verify a Google OAuth access token (from chrome.identity in the extension).
+
+    Rejects the token outright unless it was minted for *this* OAuth client, and
+    identifies the account by Google's stable `sub` - never by email, which a
+    user can change and which can be reassigned.
     """
-    # SECURITY: hard reject rather than silently skip the audience check when
-    # GOOGLE_CLIENT_ID isn't configured. In production this branch is
-    # unreachable (see fail-closed check above); in dev it means access-token
-    # login is disabled until YTM_CLIENT_ID is set, rather than accepting any
-    # Google account's token unconditionally.
     if not GOOGLE_CLIENT_ID:
         logger.warning(
             "Rejecting access token verification attempt: GOOGLE_CLIENT_ID is not configured."
@@ -155,8 +132,8 @@ def verify_google_access_token(access_token_str: str) -> Optional[dict]:
         return None
 
     try:
-        info_resp = requests.get(
-            "https://oauth2.googleapis.com/tokeninfo",
+        info_resp = _google_http.get(
+            config.GOOGLE_TOKENINFO_URL,
             params={"access_token": access_token_str},
             timeout=5,
         )
@@ -166,23 +143,28 @@ def verify_google_access_token(access_token_str: str) -> Optional[dict]:
     if info_resp.status_code != 200:
         return None
 
-    info = info_resp.json()
+    try:
+        info = info_resp.json()
+    except ValueError:
+        return None
 
-    # SECURITY: previously this only logged a warning on a client-ID mismatch
-    # and then continued anyway, meaning an access token minted for a totally
-    # different OAuth client (not this app) would still be accepted as long
-    # as it resolved to *some* valid Google account. We now hard-reject.
     if GOOGLE_CLIENT_ID not in (info.get("aud"), info.get("azp")):
         logger.warning(
-            "Rejecting access token: client ID %s did not match configured client %s",
-            info.get("aud") or info.get("azp"),
-            GOOGLE_CLIENT_ID,
+            "Rejecting access token: client ID did not match the configured client"
+        )
+        return None
+
+    # Granular consent: trust the granted scopes, never assume them.
+    granted_scope = info.get("scope") or ""
+    if granted_scope and not any(scope in granted_scope for scope in config.GOOGLE_YOUTUBE_SCOPES):
+        logger.warning(
+            "Rejecting access token: granted scopes do not include YouTube write access"
         )
         return None
 
     try:
-        userinfo_resp = requests.get(
-            "https://www.googleapis.com/oauth2/v3/userinfo",
+        userinfo_resp = _google_http.get(
+            config.GOOGLE_USERINFO_URL,
             headers={"Authorization": f"Bearer {access_token_str}"},
             timeout=5,
         )
@@ -192,7 +174,11 @@ def verify_google_access_token(access_token_str: str) -> Optional[dict]:
     if userinfo_resp.status_code != 200:
         return None
 
-    userinfo = userinfo_resp.json()
+    try:
+        userinfo = userinfo_resp.json()
+    except ValueError:
+        return None
+
     sub = userinfo.get("sub")
     if not sub:
         return None
@@ -208,7 +194,22 @@ def verify_google_access_token(access_token_str: str) -> Optional[dict]:
 def verify_google_token(token_str: str) -> dict:
     """
     Verifies either an ID token or an OAuth access token from the Google login.
+
+    Returns a dict that ALWAYS contains a non-empty `sub`. Identifies the
+    account by Google's `sub` only.
     """
+    if not isinstance(token_str, str) or not token_str.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential"
+        )
+    token_str = token_str.strip()
+    # A Google access token or an ID token; both are bounded JWT-ish strings.
+    if len(token_str) > 8192:
+        audit.security_event("auth.credential_too_large", outcome="denied", size=len(token_str))
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential"
+        )
+
     payload = verify_google_id_token(token_str)
     if payload is not None:
         return {"sub": payload["sub"], "email": payload.get("email")}
@@ -217,13 +218,223 @@ def verify_google_token(token_str: str) -> dict:
     if payload is not None:
         return payload
 
+    audit.security_event("auth.credential_rejected", outcome="denied")
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Google credential")
 
 
+# --- Stored-token helpers -----------------------------------------------------
+def encrypt_tokens(token_dict: dict, user_id: int) -> str:
+    """Seal an OAuth token dictionary for storage (AES-256-GCM envelope)."""
+    return crypto.encrypt_tokens(token_dict, user_id)
+
+
+def decrypt_tokens(encrypted_str: str, user_id: int) -> dict:
+    """Unseal a stored token dictionary. Returns {} when unreadable."""
+    return crypto.decrypt_tokens(encrypted_str, user_id)
+
+
+def needs_reencrypt(encrypted_str: str) -> bool:
+    return crypto.needs_reencrypt(encrypted_str)
+
+
+# --- Single-flight access-token refresh --------------------------------------
+_refresh_locks: dict = {}
+_refresh_locks_guard = threading.Lock()
+
+
+def _user_lock(user_id: int) -> threading.Lock:
+    with _refresh_locks_guard:
+        lock = _refresh_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _refresh_locks[user_id] = lock
+        return lock
+
+
+def _token_expired(token_data: dict, leeway_seconds: int = 120) -> bool:
+    """Best-effort expiry check. Unknown expiry is treated as NOT expired."""
+    expires_at = token_data.get("expires_at") or token_data.get("expiry_date")
+    if expires_at:
+        try:
+            value = float(expires_at)
+        except (TypeError, ValueError):
+            return False
+        # chrome.identity-style clients send epoch seconds; ytmusicapi sends a
+        # local-time datetime string. Only the numeric form is interpreted.
+        if value > 1_000_000_000:
+            return value <= (time.time() + leeway_seconds)
+        return False
+    expires_in = token_data.get("expires_in")
+    if expires_in and token_data.get("acquired_at"):
+        try:
+            return (float(token_data["acquired_at"]) + float(expires_in)) <= time.time() + leeway_seconds
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def refresh_access_token(token_data: dict, user_id: int) -> Optional[dict]:
+    """
+    Exchange a stored refresh token for a fresh access token.
+
+    Returns the updated token dict, or None when a refresh is not possible.
+    Serialised per user by a lock so N concurrent restores trigger exactly one
+    token refresh rather than N racing `invalid_grant` errors (which would also
+    invalidate the shared refresh token).
+    """
+    refresh_token = token_data.get("refresh_token")
+    if not refresh_token or not GOOGLE_CLIENT_ID:
+        return None
+
+    lock = _user_lock(user_id)
+    if not lock.acquire(blocking=False):
+        # Someone else is already refreshing for this user. Wait for them
+        # rather than starting a competing exchange.
+        if lock.acquire(timeout=10):
+            lock.release()
+            return None  # caller should re-read the stored token
+        return None
+    try:
+        body = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": GOOGLE_CLIENT_ID,
+        }
+        client_secret = os.getenv("YTM_CLIENT_SECRET")
+        if client_secret:
+            body["client_secret"] = client_secret
+        try:
+            resp = _google_http.post(config.GOOGLE_TOKEN_URL, data=body, timeout=10)
+        except requests.RequestException as exc:
+            logger.warning("Token refresh request failed for user %s: %s", user_id, exc)
+            return None
+
+        if resp.status_code != 200:
+            try:
+                err = resp.json().get("error", "unknown")
+            except ValueError:
+                err = "unknown"
+            audit.security_event(
+                "auth.token_refresh_failed", user_id=user_id, outcome="denied", error=err
+            )
+            return None
+
+        try:
+            payload = resp.json()
+        except ValueError:
+            return None
+
+        updated = dict(token_data)
+        if payload.get("access_token"):
+            updated["access_token"] = payload["access_token"]
+        if payload.get("refresh_token"):
+            updated["refresh_token"] = payload["refresh_token"]
+        if payload.get("scope"):
+            updated["scope"] = payload["scope"]
+        updated["expires_in"] = payload.get("expires_in", 3600)
+        updated["expires_at"] = int(time.time()) + int(updated.get("expires_in") or 3600)
+        updated["token_type"] = payload.get("token_type", "Bearer")
+        return updated
+    finally:
+        try:
+            lock.release()
+        except RuntimeError:  # pragma: no cover
+            pass
+
+
+def revoke_google_token(token: str) -> bool:
+    """Best-effort revocation at Google's revoke endpoint."""
+    if not token:
+        return False
+    try:
+        resp = _google_http.post(
+            config.GOOGLE_REVOKE_URL,
+            data={"token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=5,
+        )
+        return resp.status_code in (200, 204)
+    except requests.RequestException as exc:
+        logger.warning("Google token revocation failed: %s", exc)
+        return False
+
+
+# --- Session tokens -----------------------------------------------------------
 def create_access_token(user_id: int) -> str:
-    """Issues a signed JWT session token for the user."""
-    expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=JWT_EXPIRE_MINUTES)
-    return jwt.encode({"sub": str(user_id), "exp": expire}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    """Issues a signed RS256 JWT session token for the user."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    expire = now + datetime.timedelta(minutes=config.JWT_EXPIRE_MINUTES)
+    payload = {
+        "sub": str(user_id),
+        "iat": int(now.timestamp()),
+        "nbf": int(now.timestamp()),
+        "exp": int(expire.timestamp()),
+        "iss": config.JWT_ISSUER,
+        "aud": config.JWT_AUDIENCE,
+        "jti": audit.new_nonce(),
+    }
+    return jwt.encode(payload, JWT_PRIVATE_KEY, algorithm=config.JWT_ALGORITHM)
+
+
+def revoke_session(db: Session, user, reason: str = "logout") -> bool:
+    """
+    Server-side logout: blacklist the presented token's `jti` until it would
+    have expired anyway. Additive route, no frontend change required.
+    """
+    jti = getattr(user, "current_jti", None)
+    if not jti:
+        return False
+    exp = getattr(user, "current_exp", None)
+    try:
+        expires_at = datetime.datetime.utcfromtimestamp(int(exp))
+    except (TypeError, ValueError, OverflowError, OSError):
+        expires_at = datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+    db.add(models.RevokedToken(jti=jti, expires_at=expires_at))
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to revoke session for user %s", getattr(user, "id", "?"))
+        return False
+    audit.security_event(
+        "auth.logout", user_id=getattr(user, "id", None), outcome="ok", reason=reason
+    )
+    return True
+
+
+def prune_revoked_tokens(db: Session) -> int:
+    """Drop blacklist entries for tokens that expired more than N days ago."""
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(
+        days=config.REVOKED_TOKEN_RETENTION_DAYS
+    )
+    deleted = db.query(models.RevokedToken).filter(models.RevokedToken.expires_at < cutoff).delete()
+    if deleted:
+        db.commit()
+        logger.info("Pruned %s expired revoked-token entries", deleted)
+    return int(deleted or 0)
+
+
+def mark_needs_reconnect(db: Session, user, reason: str) -> None:
+    """
+    Flag the account as needing a fresh Google sign-in and drop the dead token.
+
+    `needs_reconnect` is additive and invisible to the published extension; the
+    caller still returns the existing "please sign in" 400 body.
+    """
+    try:
+        user.encrypted_token_json = ""
+        if hasattr(models.User, "needs_reconnect"):
+            user.needs_reconnect = True
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Failed to mark user %s as needing reconnect", getattr(user, "id", "?"))
+    audit.security_event(
+        "auth.reconnect_required",
+        user_id=getattr(user, "id", None),
+        outcome="denied",
+        reason=reason,
+    )
 
 
 def get_current_user(
@@ -232,11 +443,6 @@ def get_current_user(
 ) -> models.User:
     """
     Derives and verifies the authenticated user from the Bearer JWT token.
-
-    SECURITY: this previously fell back to a default "user 1" (creating it if
-    missing) whenever no Authorization header was present at all, which made
-    every "protected" endpoint reachable anonymously. There is no longer any
-    unauthenticated fallback - a missing or invalid token is always a 401.
     """
     if not credentials or not credentials.credentials:
         raise HTTPException(
@@ -246,14 +452,33 @@ def get_current_user(
         )
 
     try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        # `algorithms=[...]` pins the accepted algorithm, which is what rejects
+        # `alg: none` and any HMAC downgrade attempt on an RS256 service.
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_PUBLIC_KEY,
+            algorithms=[config.JWT_ALGORITHM],
+            audience=config.JWT_AUDIENCE,
+            issuer=config.JWT_ISSUER,
+            options={"require": ["exp", "iss", "aud", "sub"]},
+        )
         user_id = int(payload.get("sub"))
+        jti = payload.get("jti")
     except (jwt.PyJWTError, TypeError, ValueError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired session token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    if jti:
+        is_revoked = db.query(models.RevokedToken).filter(models.RevokedToken.jti == jti).first()
+        if is_revoked:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session token has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     user = db.query(models.User).filter(models.User.id == user_id).first()
     if not user:
@@ -263,4 +488,7 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Carry the validated claims so a route can revoke this exact token.
+    user.current_jti = jti
+    user.current_exp = payload.get("exp")
     return user
