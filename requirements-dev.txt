@@ -1,4 +1,7 @@
 # Development and test dependencies, on top of requirements.txt:
 #   pip install -r requirements.txt -r requirements-dev.txt
+
+
 pytest>=8.0
 pyflakes>=3.0
+httpx>=0.27
