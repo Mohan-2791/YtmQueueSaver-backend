@@ -1,12 +1,14 @@
 import datetime
 import logging
 import os
+import re
 import threading
 import time
 from typing import Optional
 
 import jwt
 import requests
+from cryptography.hazmat.primitives import serialization
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from google.oauth2 import id_token as google_id_token
@@ -34,18 +36,66 @@ bearer_scheme = HTTPBearer(auto_error=False)
 
 
 # --- App-issued session JWT (asymmetric, RS256) ------------------------------
+_PEM_RE = re.compile(
+    r"(-----BEGIN [A-Z0-9 ]+-----)\s*(.*?)\s*(-----END [A-Z0-9 ]+-----)", re.S
+)
+
+
+def _normalize_pem(value: str) -> str:
+    """
+    Repair the usual ways a PEM gets mangled when stored in an environment
+    variable: wrapping quotes, literal "\\n" escapes, CRLFs, and newlines that
+    a PaaS dashboard flattened into spaces.
+    """
+    value = value.strip()
+    # Strip matching wrapping quotes (possibly more than one layer).
+    while len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    value = value.replace("\\r", "").replace("\r", "").replace("\\n", "\n")
+
+    match = _PEM_RE.search(value)
+    if not match:
+        return value
+    header, body, footer = match.groups()
+    # Proc-Type / DEK-Info headers (legacy encrypted PEM) must keep their
+    # structure; only rebuild plain base64 bodies.
+    if ":" in body:
+        return value if value.endswith("\n") else value + "\n"
+    body = re.sub(r"\s+", "", body)
+    lines = [body[i : i + 64] for i in range(0, len(body), 64)]
+    return "\n".join([header, *lines, footer]) + "\n"
+
+
+def _validate_keys(private_pem: str, public_pem: str) -> None:
+    """Fail fast at startup if the configured PEMs cannot be parsed."""
+    try:
+        serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+    except Exception as exc:
+        raise RuntimeError(
+            "JWT_PRIVATE_KEY could not be parsed as an unencrypted PEM private key "
+            f"({type(exc).__name__}: {exc}). Check for wrapping quotes, missing "
+            "BEGIN/END lines, a truncated paste, or an encrypted key."
+        ) from exc
+    try:
+        serialization.load_pem_public_key(public_pem.encode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            "JWT_PUBLIC_KEY could not be parsed as a PEM public key "
+            f"({type(exc).__name__}: {exc}). Check for wrapping quotes, missing "
+            "BEGIN/END lines, or a truncated paste."
+        ) from exc
+
+
 def _load_jwt_keys():
     private_key = os.getenv("JWT_PRIVATE_KEY")
     public_key = os.getenv("JWT_PUBLIC_KEY")
     if private_key and public_key:
-        # Support literal "\n" escapes, which is how these usually end up in a
-        # PaaS dashboard's single-line environment variable editor.
-        private_key = private_key.replace("\\n", "\n")
-        public_key = public_key.replace("\\n", "\n")
+        private_key = _normalize_pem(private_key)
+        public_key = _normalize_pem(public_key)
+        _validate_keys(private_key, public_key)
         return private_key, public_key
     if IS_PRODUCTION:
         raise RuntimeError("JWT_PRIVATE_KEY and JWT_PUBLIC_KEY are required in production for RS256 JWTs.")
-    from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
