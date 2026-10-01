@@ -6,7 +6,7 @@ A FastAPI service that stores users' YouTube Music queue snapshots and restores 
 ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?logo=postgresql&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-79%20passing-brightgreen)
+![Tests](https://github.com/Mohan-2791/YtmQueueSaver-backend/actions/workflows/tests.yml/badge.svg)
 
 ---
 
